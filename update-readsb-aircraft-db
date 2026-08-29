@@ -1,0 +1,114 @@
+#!/bin/bash
+set -Eeuo pipefail
+umask 022
+
+MERGER="${MERGER:-/usr/local/lib/readsb-aircraft-db/readsb-db-merge.py}"
+STATE_DIR="${STATE_DIR:-/var/lib/readsb-aircraft-db}"
+DEST="${DEST:-${STATE_DIR}/aircraft.csv.gz}"
+BACKUP_DIR="${BACKUP_DIR:-${STATE_DIR}/backups}"
+WIEDEHOPF_URL="${WIEDEHOPF_URL:-https://raw.githubusercontent.com/wiedehopf/tar1090-db/csv/aircraft.csv.gz}"
+ADSBX_URL="${ADSBX_URL:-https://downloads.adsbexchange.com/downloads/basic-ac-db.json.gz}"
+MIN_RECORDS="${MIN_RECORDS:-500000}"
+MAX_INPUT_ERRORS="${MAX_INPUT_ERRORS:-100}"
+KEEP_BACKUPS="${KEEP_BACKUPS:-7}"
+LOCKFILE="${LOCKFILE:-/run/lock/readsb-aircraft-db.lock}"
+
+if [[ "${READSB_DB_SYSLOG:-0}" == "1" ]] && command -v logger >/dev/null 2>&1; then
+    exec > >(logger -t readsb-aircraft-db) 2>&1
+fi
+
+log() { printf '%s %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*"; }
+die() { log "ERROR: $*"; exit 1; }
+
+[[ -x "$MERGER" || -f "$MERGER" ]] || die "merger not found: $MERGER"
+command -v python3 >/dev/null 2>&1 || die "python3 not installed"
+command -v gzip >/dev/null 2>&1 || die "gzip not installed"
+command -v sha256sum >/dev/null 2>&1 || die "sha256sum not installed"
+
+mkdir -p "$STATE_DIR" "$BACKUP_DIR" "$(dirname "$DEST")" "$(dirname "$LOCKFILE")"
+
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"$LOCKFILE"
+    if ! flock -n 9; then
+        log "another update is already running; exiting"
+        exit 0
+    fi
+fi
+
+TMPDIR_RUN="$(mktemp -d "${STATE_DIR}/.update.XXXXXXXX")"
+trap 'rm -rf "$TMPDIR_RUN"' EXIT
+
+WFILE="$TMPDIR_RUN/aircraft.csv.gz"
+AFILE="$TMPDIR_RUN/basic-ac-db.json.gz"
+NEWDB="$TMPDIR_RUN/aircraft.merged.csv.gz"
+REPORT="$TMPDIR_RUN/merge-report.json"
+CONFLICTS="$TMPDIR_RUN/merge-conflicts.csv.gz"
+
+fetch() {
+    local url="$1" out="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl --fail --silent --show-error --location \
+             --retry 5 --retry-delay 5 --retry-all-errors \
+             --connect-timeout 20 --max-time 300 \
+             --user-agent 'readsb-aircraft-db-merge/1.0' \
+             --output "$out" "$url"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q --tries=5 --timeout=30 -O "$out" "$url"
+    else
+        die "need curl or wget"
+    fi
+    gzip -t "$out" || die "downloaded file is not a valid gzip: $url"
+}
+
+log "downloading Wiedehopf and ADSBX source snapshots"
+fetch "$WIEDEHOPF_URL" "$WFILE"
+fetch "$ADSBX_URL" "$AFILE"
+
+log "merging sources"
+python3 "$MERGER" \
+    --wiedehopf "$WFILE" \
+    --adsbx "$AFILE" \
+    --output "$NEWDB" \
+    --report "$REPORT" \
+    --conflicts "$CONFLICTS" \
+    --min-records "$MIN_RECORDS" \
+    --max-input-errors "$MAX_INPUT_ERRORS"
+
+gzip -t "$NEWDB" || die "new merged database failed gzip validation"
+gzip -t "$CONFLICTS" || die "conflict report failed gzip validation"
+
+install -m 0644 "$REPORT" "${STATE_DIR}/.last-report.json.new"
+mv -f "${STATE_DIR}/.last-report.json.new" "${STATE_DIR}/last-report.json"
+install -m 0644 "$CONFLICTS" "${STATE_DIR}/.last-conflicts.csv.gz.new"
+mv -f "${STATE_DIR}/.last-conflicts.csv.gz.new" "${STATE_DIR}/last-conflicts.csv.gz"
+
+new_hash="$(gzip -dc "$NEWDB" | sha256sum | awk '{print $1}')"
+old_hash=""
+if [[ -f "$DEST" ]] && gzip -t "$DEST" >/dev/null 2>&1; then
+    old_hash="$(gzip -dc "$DEST" | sha256sum | awk '{print $1}')"
+fi
+
+if [[ -n "$old_hash" && "$new_hash" == "$old_hash" ]]; then
+    log "merged content unchanged; keeping existing database mtime"
+    exit 0
+fi
+
+if [[ -f "$DEST" ]]; then
+    stamp="$(date -u +'%Y%m%dT%H%M%SZ')"
+    cp -a "$DEST" "${BACKUP_DIR}/aircraft-${stamp}.csv.gz"
+fi
+
+install -m 0644 "$NEWDB" "${DEST}.new"
+mv -f "${DEST}.new" "$DEST"
+
+if [[ "$KEEP_BACKUPS" =~ ^[0-9]+$ ]] && (( KEEP_BACKUPS >= 0 )); then
+    mapfile -t backups < <(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'aircraft-*.csv.gz' -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk '{print $2}')
+    if (( ${#backups[@]} > KEEP_BACKUPS )); then
+        for ((i=KEEP_BACKUPS; i<${#backups[@]}; i++)); do
+            rm -f -- "${backups[$i]}"
+        done
+    fi
+fi
+
+log "installed merged database: $DEST"
+log "uncompressed SHA256: $new_hash"
