@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.csv.gz
+*.json.gz
+merge-report.json
+merge-conflicts.csv.gz
+.DS_Store
