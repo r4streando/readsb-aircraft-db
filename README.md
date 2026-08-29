@@ -15,10 +15,21 @@ Core policy:
 
 ## Install on the readsb host
 
+Because this repository is private, clone it using the Pi's authenticated GitHub access. With GitHub CLI:
+
+```bash
+gh repo clone r4streando/readsb-aircraft-db
+cd readsb-aircraft-db
+sudo bash install.sh
+sudo /usr/local/sbin/update-readsb-aircraft-db
+```
+
+Or with an authenticated SSH key:
+
 ```bash
 git clone git@github.com:r4streando/readsb-aircraft-db.git
 cd readsb-aircraft-db
-sudo ./install.sh
+sudo bash install.sh
 sudo /usr/local/sbin/update-readsb-aircraft-db
 ```
 
@@ -54,3 +65,15 @@ Audit artifacts:
 /var/lib/readsb-aircraft-db/last-conflicts.csv.gz
 /var/lib/readsb-aircraft-db/backups/
 ```
+
+## Validation baseline
+
+Tested against the supplied August 24 / August 29, 2026 snapshots:
+
+- output rows: 616,480
+- registrations: 614,893
+- descriptions: 498,948
+- PIA records with registrations: 50,423 / 50,423
+- LADD records with registrations: 30,315 / 30,315
+- malformed readsb output rows: 0
+- logged source conflicts/flag changes: 14,637
