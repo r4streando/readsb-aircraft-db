@@ -1,0 +1,7 @@
+# Merge fresh Wiedehopf + ADS-B Exchange aircraft databases once daily.
+# Newer snapshot wins nonblank conflicts; blanks never erase known values.
+# PIA/LADD flags never suppress registration or other metadata.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+17 03 * * * root READSB_DB_SYSLOG=1 /usr/local/sbin/update-readsb-aircraft-db
