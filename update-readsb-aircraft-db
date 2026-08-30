@@ -6,11 +6,14 @@ MERGER="${MERGER:-/usr/local/lib/readsb-aircraft-db/readsb-db-merge.py}"
 STATE_DIR="${STATE_DIR:-/var/lib/readsb-aircraft-db}"
 DEST="${DEST:-${STATE_DIR}/aircraft.csv.gz}"
 BACKUP_DIR="${BACKUP_DIR:-${STATE_DIR}/backups}"
+VDLM2_DEST="${VDLM2_DEST:-${STATE_DIR}/vdlm2-aircraft.json}"
+VDLM2_BACKUP_DIR="${VDLM2_BACKUP_DIR:-${STATE_DIR}/backups/vdlm2}"
 WIEDEHOPF_URL="${WIEDEHOPF_URL:-https://raw.githubusercontent.com/wiedehopf/tar1090-db/csv/aircraft.csv.gz}"
 ADSBX_URL="${ADSBX_URL:-https://downloads.adsbexchange.com/downloads/basic-ac-db.json.gz}"
 MIN_RECORDS="${MIN_RECORDS:-500000}"
 MAX_INPUT_ERRORS="${MAX_INPUT_ERRORS:-100}"
 KEEP_BACKUPS="${KEEP_BACKUPS:-7}"
+VDLM2_KEEP_BACKUPS="${VDLM2_KEEP_BACKUPS:-$KEEP_BACKUPS}"
 LOCKFILE="${LOCKFILE:-/run/lock/readsb-aircraft-db.lock}"
 
 if [[ "${READSB_DB_SYSLOG:-0}" == "1" ]] && command -v logger >/dev/null 2>&1; then
@@ -25,7 +28,7 @@ command -v python3 >/dev/null 2>&1 || die "python3 not installed"
 command -v gzip >/dev/null 2>&1 || die "gzip not installed"
 command -v sha256sum >/dev/null 2>&1 || die "sha256sum not installed"
 
-mkdir -p "$STATE_DIR" "$BACKUP_DIR" "$(dirname "$DEST")" "$(dirname "$LOCKFILE")"
+mkdir -p "$STATE_DIR" "$BACKUP_DIR" "$VDLM2_BACKUP_DIR" "$(dirname "$DEST")" "$(dirname "$VDLM2_DEST")" "$(dirname "$LOCKFILE")"
 
 if command -v flock >/dev/null 2>&1; then
     exec 9>"$LOCKFILE"
@@ -41,6 +44,7 @@ trap 'rm -rf "$TMPDIR_RUN"' EXIT
 WFILE="$TMPDIR_RUN/aircraft.csv.gz"
 AFILE="$TMPDIR_RUN/basic-ac-db.json.gz"
 NEWDB="$TMPDIR_RUN/aircraft.merged.csv.gz"
+NEW_VDLM2="$TMPDIR_RUN/vdlm2-aircraft.json"
 REPORT="$TMPDIR_RUN/merge-report.json"
 CONFLICTS="$TMPDIR_RUN/merge-conflicts.csv.gz"
 
@@ -69,6 +73,7 @@ python3 "$MERGER" \
     --wiedehopf "$WFILE" \
     --adsbx "$AFILE" \
     --output "$NEWDB" \
+    --vdlm2-output "$NEW_VDLM2" \
     --report "$REPORT" \
     --conflicts "$CONFLICTS" \
     --min-records "$MIN_RECORDS" \
@@ -76,6 +81,49 @@ python3 "$MERGER" \
 
 gzip -t "$NEWDB" || die "new merged database failed gzip validation"
 gzip -t "$CONFLICTS" || die "conflict report failed gzip validation"
+
+python3 - "$NEW_VDLM2" <<'PY' || die "new VDLm2 database failed validation"
+import json, re, sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+keys = ['icao', 'reg', 'icaotype', 'year', 'manufacturer', 'model', 'ownop',
+        'faa_pia', 'faa_ladd', 'short_type', 'mil']
+previous = None
+count = 0
+with path.open(encoding='utf-8') as source:
+    for number, line in enumerate(source, 1):
+        if not line.endswith('\n'):
+            raise ValueError(f'line {number}: missing newline')
+        record = json.loads(line)
+        if list(record) != keys:
+            raise ValueError(f'line {number}: wrong fields or field order')
+        icao = record['icao']
+        if not isinstance(icao, str) or not re.fullmatch(r'[0-9A-F]{6}', icao):
+            raise ValueError(f'line {number}: invalid ICAO')
+        if previous is not None and icao <= previous:
+            raise ValueError(f'line {number}: ICAOs not strictly sorted')
+        previous = icao
+        for key in ('reg', 'icaotype', 'manufacturer', 'model', 'ownop', 'short_type'):
+            if record[key] is not None and not isinstance(record[key], str):
+                raise ValueError(f'line {number}: {key} is not string/null')
+        if record['icaotype'] is not None and record['icaotype'] != record['icaotype'].upper():
+            raise ValueError(f'line {number}: icaotype is not uppercase')
+        if record['short_type'] is not None and record['short_type'] != record['short_type'].upper():
+            raise ValueError(f'line {number}: short_type is not uppercase')
+        if record['year'] is not None and (type(record['year']) is not int):
+            raise ValueError(f'line {number}: year is not integer/null')
+        for key in ('faa_pia', 'faa_ladd', 'mil'):
+            if type(record[key]) is not bool:
+                raise ValueError(f'line {number}: {key} is not boolean')
+        count += 1
+if count == 0:
+    raise ValueError('empty VDLm2 database')
+PY
+
+readsb_count="$(gzip -dc "$NEWDB" | wc -l)"
+vdlm2_count="$(wc -l < "$NEW_VDLM2")"
+[[ "$readsb_count" == "$vdlm2_count" ]] || die "candidate record counts differ: readsb=$readsb_count vdlm2=$vdlm2_count"
 
 install -m 0644 "$REPORT" "${STATE_DIR}/.last-report.json.new"
 mv -f "${STATE_DIR}/.last-report.json.new" "${STATE_DIR}/last-report.json"
@@ -88,27 +136,51 @@ if [[ -f "$DEST" ]] && gzip -t "$DEST" >/dev/null 2>&1; then
     old_hash="$(gzip -dc "$DEST" | sha256sum | awk '{print $1}')"
 fi
 
-if [[ -n "$old_hash" && "$new_hash" == "$old_hash" ]]; then
-    log "merged content unchanged; keeping existing database mtime"
+new_vdlm2_hash="$(sha256sum "$NEW_VDLM2" | awk '{print $1}')"
+old_vdlm2_hash=""
+if [[ -f "$VDLM2_DEST" ]]; then
+    old_vdlm2_hash="$(sha256sum "$VDLM2_DEST" | awk '{print $1}')"
+fi
+
+readsb_changed=1
+vdlm2_changed=1
+[[ -n "$old_hash" && "$new_hash" == "$old_hash" ]] && readsb_changed=0
+[[ -n "$old_vdlm2_hash" && "$new_vdlm2_hash" == "$old_vdlm2_hash" ]] && vdlm2_changed=0
+
+if (( ! readsb_changed && ! vdlm2_changed )); then
+    log "both projections unchanged; keeping existing database mtimes"
     exit 0
 fi
 
-if [[ -f "$DEST" ]]; then
-    stamp="$(date -u +'%Y%m%dT%H%M%SZ')"
+stamp="$(date -u +'%Y%m%dT%H%M%SZ')"
+if (( readsb_changed )) && [[ -f "$DEST" ]]; then
     cp -a "$DEST" "${BACKUP_DIR}/aircraft-${stamp}.csv.gz"
 fi
+if (( vdlm2_changed )) && [[ -f "$VDLM2_DEST" ]]; then
+    cp -a "$VDLM2_DEST" "${VDLM2_BACKUP_DIR}/vdlm2-aircraft-${stamp}.json"
+fi
 
-install -m 0644 "$NEWDB" "${DEST}.new"
-mv -f "${DEST}.new" "$DEST"
+if (( readsb_changed )); then
+    install -m 0644 "$NEWDB" "${DEST}.new"
+fi
+if (( vdlm2_changed )); then
+    install -m 0644 "$NEW_VDLM2" "${VDLM2_DEST}.new"
+fi
+if (( readsb_changed )); then mv -f "${DEST}.new" "$DEST"; fi
+if (( vdlm2_changed )); then mv -f "${VDLM2_DEST}.new" "$VDLM2_DEST"; fi
 
-if [[ "$KEEP_BACKUPS" =~ ^[0-9]+$ ]] && (( KEEP_BACKUPS >= 0 )); then
-    mapfile -t backups < <(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'aircraft-*.csv.gz' -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk '{print $2}')
-    if (( ${#backups[@]} > KEEP_BACKUPS )); then
-        for ((i=KEEP_BACKUPS; i<${#backups[@]}; i++)); do
+prune_backups() {
+    local directory="$1" pattern="$2" keep="$3"
+    [[ "$keep" =~ ^[0-9]+$ ]] || return 0
+    mapfile -t backups < <(find "$directory" -maxdepth 1 -type f -name "$pattern" -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk '{print $2}')
+    if (( ${#backups[@]} > keep )); then
+        for ((i=keep; i<${#backups[@]}; i++)); do
             rm -f -- "${backups[$i]}"
         done
     fi
-fi
+}
+prune_backups "$BACKUP_DIR" 'aircraft-*.csv.gz' "$KEEP_BACKUPS"
+prune_backups "$VDLM2_BACKUP_DIR" 'vdlm2-aircraft-*.json' "$VDLM2_KEEP_BACKUPS"
 
-log "installed merged database: $DEST"
-log "uncompressed SHA256: $new_hash"
+if (( readsb_changed )); then log "installed readsb database: $DEST (uncompressed SHA256: $new_hash)"; else log "readsb projection unchanged; keeping mtime"; fi
+if (( vdlm2_changed )); then log "installed VDLm2 database: $VDLM2_DEST (SHA256: $new_vdlm2_hash)"; else log "VDLm2 projection unchanged; keeping mtime"; fi

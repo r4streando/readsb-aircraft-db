@@ -3,9 +3,26 @@ from __future__ import annotations
 
 import argparse, csv, datetime as dt, gzip, hashlib, io, json, os, re, struct, sys, tempfile, time
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 
 ICAO_RE = re.compile(r'^[0-9A-F]{6}$')
+
+@dataclass(frozen=True)
+class Aircraft:
+    icao: str
+    reg: str
+    icaotype: str
+    year: str
+    ownop: str
+    manufacturer: str
+    model: str
+    short_type: str
+    description: str
+    mil: bool
+    interesting: bool
+    faa_pia: bool
+    faa_ladd: bool
 
 def clean(v):
     if v is None: return ''
@@ -112,14 +129,91 @@ def atomic_gzip_writer(target: Path):
     gz = gzip.GzipFile(filename='', mode='wb', fileobj=raw, compresslevel=9, mtime=int(time.time()))
     return io.TextIOWrapper(gz, encoding='utf-8', newline='\n'), Path(name)
 
+def atomic_text_writer(target: Path):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix='.' + target.name + '.', suffix='.tmp', dir=target.parent)
+    return os.fdopen(fd, 'w', encoding='utf-8', newline='\n'), Path(name)
+
 def finish(fh, tmp, target):
     fh.flush(); fh.close(); os.chmod(tmp, 0o644); os.replace(tmp, target)
+
+def reconcile(wdb, adb, fresher, conflicts, stats):
+    for icao in sorted(set(wdb) | set(adb)):
+        w, a = wdb.get(icao), adb.get(icao)
+        wr, wt, wy, wo = (w.get('reg',''), w.get('type',''), w.get('year',''), w.get('ownop','')) if w else ('','','','')
+        ar, at, ay, ao = (a.get('reg',''), a.get('icaotype',''), a.get('year',''), a.get('ownop','')) if a else ('','','','')
+        reg, rsrc, rc = choose(wr, ar, fresher)
+        typ, tsrc, tc = choose(wt, at, fresher); typ = typ.upper()
+        year, ysrc, yc = choose(wy, ay, fresher)
+        own, osrc, oc = choose(wo, ao, fresher)
+        for field, c, wv, av, val, src in (('registration',rc,wr,ar,reg,rsrc),('icaotype',tc,wt,at,typ,tsrc),('year',yc,wy,ay,year,ysrc),('owner',oc,wo,ao,own,osrc)):
+            if c: conflicts.append([icao, field, clean(wv), clean(av), val, src, 'newer_nonblank_source'])
+
+        wd = clean(w.get('desc')) if w else ''
+        ad = ads_desc(a)
+        desc = wd or ad
+        if not wd and ad: stats['description_filled_from_adsbx'] += 1
+
+        if w: wmil, wint, wpia, wladd = parse_flags(w.get('flags',''))
+        else: wmil=wint=wpia=wladd=False
+        if a: amil, apia, aladd = bool(a.get('mil')), bool(a.get('faa_pia')), bool(a.get('faa_ladd'))
+        else: amil=apia=aladd=False
+
+        mil = wmil or amil
+        interesting = wint
+        if w and a:
+            pia, ladd = (apia, aladd) if fresher == 'adsbx' else (wpia, wladd)
+            if wpia != apia: conflicts.append([icao,'PIA',int(wpia),int(apia),int(pia),fresher,'newer_snapshot'])
+            if wladd != aladd: conflicts.append([icao,'LADD',int(wladd),int(aladd),int(ladd),fresher,'newer_snapshot'])
+            if wmil != amil: conflicts.append([icao,'military',int(wmil),int(amil),int(mil),'either_true','logical_OR'])
+        elif a: pia, ladd = apia, aladd
+        else: pia, ladd = wpia, wladd
+
+        manufacturer = clean(a.get('manufacturer')) if a else ''
+        model = clean(a.get('model')) if a else ''
+        short_type = clean(a.get('short_type')).upper() if a else ''
+        # ADSBx-only descriptors may belong to a stale/displaced airframe. Suppress
+        # them when newer Wiedehopf identity data wins a nonblank reg/type conflict.
+        displaced_adsbx_identity = fresher == 'wiedehopf' and (rc or tc)
+        if displaced_adsbx_identity:
+            manufacturer = model = short_type = ''
+            stats['adsbx_descriptors_suppressed_identity_conflict'] += 1
+
+        yield Aircraft(icao, reg, typ, year, own, manufacturer, model, short_type,
+                       desc, mil, interesting, pia, ladd)
+
+def render_readsb(ac: Aircraft):
+    flags = fmt_flags(ac.mil, ac.interesting, ac.faa_pia, ac.faa_ladd)
+    fields = [clean(x) for x in (ac.icao, ac.reg, ac.icaotype, flags,
+                                  ac.description, ac.year, ac.ownop, '')]
+    line = ';'.join(fields) + '\n'
+    if line.count(';') != 7 or not line.rstrip('\n').endswith(';'):
+        raise AssertionError(f'bad output structure for {ac.icao}')
+    return line
+
+def nullable(s):
+    return s or None
+
+def json_year(s):
+    return int(s) if re.fullmatch(r'[0-9]+', s) else None
+
+def render_vdlm2(ac: Aircraft):
+    record = {
+        'icao': ac.icao, 'reg': nullable(ac.reg),
+        'icaotype': nullable(ac.icaotype), 'year': json_year(ac.year),
+        'manufacturer': nullable(ac.manufacturer), 'model': nullable(ac.model),
+        'ownop': nullable(ac.ownop), 'faa_pia': ac.faa_pia,
+        'faa_ladd': ac.faa_ladd, 'short_type': nullable(ac.short_type),
+        'mil': ac.mil,
+    }
+    return json.dumps(record, ensure_ascii=False, separators=(',', ':')) + '\n'
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--wiedehopf', required=True, type=Path)
     ap.add_argument('--adsbx', required=True, type=Path)
     ap.add_argument('--output', required=True, type=Path)
+    ap.add_argument('--vdlm2-output', type=Path)
     ap.add_argument('--report', type=Path)
     ap.add_argument('--conflicts', type=Path)
     ap.add_argument('--min-records', type=int, default=500000)
@@ -140,62 +234,37 @@ def main():
     all_icaos = sorted(set(wdb) | set(adb))
     coverage, stats, conflicts = Counter(), Counter(), []
     out, tmp = atomic_gzip_writer(args.output)
+    vout = vtmp = None
+    if args.vdlm2_output:
+        vout, vtmp = atomic_text_writer(args.vdlm2_output)
     try:
-        for icao in all_icaos:
-            w, a = wdb.get(icao), adb.get(icao)
-            wr, wt, wy, wo = (w.get('reg',''), w.get('type',''), w.get('year',''), w.get('ownop','')) if w else ('','','','')
-            ar, at, ay, ao = (a.get('reg',''), a.get('icaotype',''), a.get('year',''), a.get('ownop','')) if a else ('','','','')
-            reg, rsrc, rc = choose(wr, ar, fresher)
-            typ, tsrc, tc = choose(wt, at, fresher); typ = typ.upper()
-            year, ysrc, yc = choose(wy, ay, fresher)
-            own, osrc, oc = choose(wo, ao, fresher)
-            for field, c, wv, av, val, src in (('registration',rc,wr,ar,reg,rsrc),('icaotype',tc,wt,at,typ,tsrc),('year',yc,wy,ay,year,ysrc),('owner',oc,wo,ao,own,osrc)):
-                if c: conflicts.append([icao, field, clean(wv), clean(av), val, src, 'newer_nonblank_source'])
+        for ac in reconcile(wdb, adb, fresher, conflicts, stats):
+            out.write(render_readsb(ac))
+            if vout: vout.write(render_vdlm2(ac))
 
-            wd = clean(w.get('desc')) if w else ''
-            ad = ads_desc(a)
-            desc = wd or ad
-            if not wd and ad: stats['description_filled_from_adsbx'] += 1
-
-            if w: wmil, wint, wpia, wladd = parse_flags(w.get('flags',''))
-            else: wmil=wint=wpia=wladd=False
-            if a: amil, apia, aladd = bool(a.get('mil')), bool(a.get('faa_pia')), bool(a.get('faa_ladd'))
-            else: amil=apia=aladd=False
-
-            mil = wmil or amil
-            interesting = wint
-            if w and a:
-                pia, ladd = (apia, aladd) if fresher == 'adsbx' else (wpia, wladd)
-                if wpia != apia: conflicts.append([icao,'PIA',int(wpia),int(apia),int(pia),fresher,'newer_snapshot'])
-                if wladd != aladd: conflicts.append([icao,'LADD',int(wladd),int(aladd),int(ladd),fresher,'newer_snapshot'])
-                if wmil != amil: conflicts.append([icao,'military',int(wmil),int(amil),int(mil),'either_true','logical_OR'])
-            elif a: pia, ladd = apia, aladd
-            else: pia, ladd = wpia, wladd
-
-            flags = fmt_flags(mil, interesting, pia, ladd)
-            fields = [clean(x) for x in (icao, reg, typ, flags, desc, year, own, '')]
-            line = ';'.join(fields) + '\n'
-            if line.count(';') != 7 or not line.rstrip('\n').endswith(';'):
-                raise AssertionError(f'bad output structure for {icao}')
-            out.write(line)
-
-            if reg: coverage['registration'] += 1
-            if typ: coverage['icaotype'] += 1
-            if desc: coverage['description'] += 1
-            if year: coverage['year'] += 1
-            if own: coverage['owner_operator'] += 1
-            if pia:
+            if ac.reg: coverage['registration'] += 1
+            if ac.icaotype: coverage['icaotype'] += 1
+            if ac.description: coverage['description'] += 1
+            if ac.year: coverage['year'] += 1
+            if ac.ownop: coverage['owner_operator'] += 1
+            if ac.faa_pia:
                 coverage['PIA'] += 1
-                if reg: stats['pia_with_registration'] += 1
-            if ladd:
+                if ac.reg: stats['pia_with_registration'] += 1
+            if ac.faa_ladd:
                 coverage['LADD'] += 1
-                if reg: stats['ladd_with_registration'] += 1
+                if ac.reg: stats['ladd_with_registration'] += 1
+            a, w = adb.get(ac.icao), wdb.get(ac.icao)
             if a and bool(a.get('faa_pia')) and clean(a.get('reg')) and not clean(w.get('reg') if w else ''):
                 stats['pia_registrations_restored_from_adsbx'] += 1
         finish(out, tmp, args.output)
+        if vout: finish(vout, vtmp, args.vdlm2_output)
     except Exception:
-        try: out.close()
-        finally: tmp.unlink(missing_ok=True)
+        try:
+            out.close()
+            if vout: vout.close()
+        finally:
+            tmp.unlink(missing_ok=True)
+            if vtmp: vtmp.unlink(missing_ok=True)
         raise
 
     if args.conflicts:
@@ -207,13 +276,15 @@ def main():
 
     report = {
         'generated_at_utc': dt.datetime.now(dt.timezone.utc).isoformat().replace('+00:00','Z'),
-        'policy': {'fresher_source':fresher,'freshness_basis':basis,'blank_never_overwrites_known':True,'pia_ladd_never_blank_metadata':True,'military':'logical OR','interesting':'Wiedehopf retained'},
+        'policy': {'fresher_source':fresher,'freshness_basis':basis,'blank_never_overwrites_known':True,'pia_ladd_never_blank_metadata':True,'military':'logical OR','interesting':'Wiedehopf retained','adsbx_descriptors':'suppressed when newer Wiedehopf wins registration or ICAO-type conflict'},
         'sources': {
             'wiedehopf': {'gzip_mtime':wm,'sha256':sha256(args.wiedehopf),'parse':dict(ws),'sample_errors':we},
             'adsbx': {'gzip_mtime':am,'sha256':sha256(args.adsbx),'parse':dict(aas),'sample_errors':ae}},
         'sets': {'wiedehopf':len(wdb),'adsbx':len(adb),'shared':len(set(wdb)&set(adb)),'wiedehopf_only':len(set(wdb)-set(adb)),'adsbx_only':len(set(adb)-set(wdb)),'output':len(all_icaos)},
         'coverage': dict(coverage), 'merge_stats':dict(stats), 'conflicts':len(conflicts),
         'output': {'path':str(args.output),'bytes':args.output.stat().st_size,'sha256':sha256(args.output)} }
+    if args.vdlm2_output:
+        report['vdlm2_output'] = {'path':str(args.vdlm2_output),'bytes':args.vdlm2_output.stat().st_size,'sha256':sha256(args.vdlm2_output)}
     if args.report:
         args.report.parent.mkdir(parents=True, exist_ok=True)
         t = args.report.with_name('.'+args.report.name+'.tmp')

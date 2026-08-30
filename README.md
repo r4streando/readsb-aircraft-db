@@ -1,6 +1,6 @@
 # readsb-aircraft-db
 
-Builds a freshness-aware, non-destructive `aircraft.csv.gz` for readsb by merging Wiedehopf's readsb/tar1090 aircraft CSV with ADS-B Exchange's `basic-ac-db.json.gz`.
+Builds freshness-aware aircraft databases for readsb and VDLm2 Monitor by merging Wiedehopf's readsb/tar1090 aircraft CSV with ADS-B Exchange's `basic-ac-db.json.gz`. Both projections are produced from one shared reconciliation pass.
 
 Core policy:
 
@@ -12,6 +12,15 @@ Core policy:
 - military is retained when either source marks the aircraft military;
 - Wiedehopf's `interesting` flag is retained;
 - output uses readsb's native format: `ICAO;registration;icaotype;flags;description;year;owner/operator;`.
+
+The readsb projection retains the existing format and merge behavior. The VDLm2 projection is plain UTF-8 newline-delimited JSON, sorted by ICAO, and contains the same union of valid ICAOs. Every VDLm2 record has exactly these fields:
+
+```text
+icao, reg, icaotype, year, manufacturer, model, ownop,
+faa_pia, faa_ladd, short_type, mil
+```
+
+Unknown strings and years are JSON `null`; flags are booleans and valid years are integers. ADSBx is the only source for manufacturer, model, and short type. Those three fields are conservatively suppressed when a newer Wiedehopf snapshot wins a conflicting nonblank registration or ICAO type, because the ADSBx descriptors may belong to the displaced airframe identity. Wiedehopf descriptions are never heuristically split.
 
 ## Install on the readsb host
 
@@ -52,11 +61,14 @@ Source snapshots:
 
 ## Data path
 
-Generated database:
+Generated databases:
 
 ```text
 /var/lib/readsb-aircraft-db/aircraft.csv.gz
+/var/lib/readsb-aircraft-db/vdlm2-aircraft.json
 ```
+
+The updater validates both candidates before changing either installed output. Each changed file is staged alongside its destination and atomically renamed into place. Content hashes and mtimes are handled independently: readsb uses the uncompressed SHA-256, while VDLm2 uses the ordinary file SHA-256. Backups are separately scoped. The updater does not restart either consumer; VDLm2 Monitor must be restarted or gain its own hot-reload support before a changed database is loaded.
 
 Audit artifacts:
 
@@ -65,6 +77,18 @@ Audit artifacts:
 /var/lib/readsb-aircraft-db/last-conflicts.csv.gz
 /var/lib/readsb-aircraft-db/backups/
 ```
+
+Environment overrides include `DEST`, `VDLM2_DEST`, `BACKUP_DIR`, and `VDLM2_BACKUP_DIR`.
+
+## Tests
+
+The test suite uses only generated local fixtures and temporary directories:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+It covers frozen decompressed readsb output, union projection behavior, JSON null/type rules, conservative descriptor suppression, independent unchanged mtimes, and failure-before-publication behavior.
 
 ## Validation baseline
 
