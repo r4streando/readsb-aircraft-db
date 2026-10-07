@@ -1,65 +1,217 @@
 # readsb-aircraft-db
 
-Builds freshness-aware aircraft databases for readsb and VDLm2 Monitor by merging Wiedehopf's readsb/tar1090 aircraft CSV with ADS-B Exchange's `basic-ac-db.json.gz`. Both projections are produced from one shared reconciliation pass.
+Builds freshness-aware aircraft databases for [readsb](https://github.com/wiedehopf/readsb) and VDLm2 Monitor by merging Wiedehopf's readsb/tar1090 aircraft CSV with ADS-B Exchange's `basic-ac-db.json.gz`.
 
-Core policy:
+Both output projections are produced from one shared reconciliation pass.
 
-- union every valid ICAO address known to either source;
-- a blank value never replaces a known value;
-- PIA/LADD flags **never** suppress registration or other aircraft metadata;
-- when both sources contain different nonblank values for registration, ICAO type, year, or owner/operator, the snapshot with the newer gzip-header timestamp wins;
-- Wiedehopf long descriptions are retained when available, otherwise ADSBX manufacturer + model fill the readsb description field;
-- military is retained when either source marks the aircraft military;
-- Wiedehopf's `interesting` flag is retained;
-- output uses readsb's native format: `ICAO;registration;icaotype;flags;description;year;owner/operator;`.
+## Merge policy
 
-The readsb projection retains the existing format and merge behavior. The VDLm2 projection is plain UTF-8 newline-delimited JSON, sorted by ICAO, and contains the same union of valid ICAOs. Every VDLm2 record has exactly these fields:
+- Union every valid ICAO address known to either source.
+- A blank value never replaces a known value.
+- PIA/LADD flags **never** suppress registration or other aircraft metadata.
+- When both sources contain different nonblank values for registration, ICAO type, year, or owner/operator, the snapshot with the newer gzip-header timestamp wins.
+- Wiedehopf long descriptions are retained when available; otherwise ADSBx manufacturer + model fill the readsb description field.
+- Military status is retained when either source marks the aircraft military.
+- Wiedehopf's `interesting` flag is retained.
+
+## Outputs
+
+### readsb
+
+The readsb projection uses readsb's native semicolon-delimited format:
+
+```text
+ICAO;registration;icaotype;flags;description;year;owner/operator;
+```
+
+Installed path:
+
+```text
+/var/lib/readsb-aircraft-db/aircraft.csv.gz
+```
+
+### VDLm2 Monitor
+
+The VDLm2 projection is UTF-8 newline-delimited JSON, sorted by ICAO. Every record has exactly these fields:
 
 ```text
 icao, reg, icaotype, year, manufacturer, model, ownop,
 faa_pia, faa_ladd, short_type, mil
 ```
 
-Unknown strings and years are JSON `null`; flags are booleans and valid years are integers. ADSBx is the only source for manufacturer, model, and short type. Those three fields are conservatively suppressed when a newer Wiedehopf snapshot wins a conflicting nonblank registration or ICAO type, because the ADSBx descriptors may belong to the displaced airframe identity. Wiedehopf descriptions are never heuristically split.
+Installed path:
 
-## Install on the readsb host
+```text
+/var/lib/readsb-aircraft-db/vdlm2-aircraft.json
+```
 
-Because this repository is private, clone it using the Pi's authenticated GitHub access. With GitHub CLI:
+Unknown strings and years are JSON `null`; flags are booleans and valid years are integers.
+
+ADSBx is the only source for manufacturer, model, and short type. Those three fields are conservatively suppressed when a newer Wiedehopf snapshot wins a conflicting nonblank registration or ICAO type, because the ADSBx descriptors may belong to the displaced airframe identity. Wiedehopf descriptions are never heuristically split.
+
+## Deployment
+
+The repository is public. No GitHub account, SSH key, personal access token, or GitHub CLI authentication is required to install or update it.
+
+### Requirements
+
+Runtime requirements:
+
+- Linux with Bash
+- Python 3
+- `gzip`
+- `sha256sum`
+- either `curl` or `wget`
+- `flock` is recommended to prevent overlapping updater runs
+- a cron daemon if automatic daily updates are desired
+
+On Debian, Ubuntu, or Raspberry Pi OS, the usual packages are:
 
 ```bash
-gh repo clone r4streando/readsb-aircraft-db
+sudo apt update
+sudo apt install -y git python3 curl gzip coreutils util-linux cron
+```
+
+### 1. Clone the public repository
+
+```bash
+git clone https://github.com/r4streando/readsb-aircraft-db.git
 cd readsb-aircraft-db
+```
+
+### 2. Install the updater
+
+```bash
 sudo bash install.sh
+```
+
+The installer copies:
+
+```text
+/usr/local/lib/readsb-aircraft-db/readsb-db-merge.py
+/usr/local/sbin/update-readsb-aircraft-db
+/etc/cron.d/readsb-aircraft-db
+```
+
+and creates the state directory:
+
+```text
+/var/lib/readsb-aircraft-db/
+```
+
+### 3. Build the database for the first time
+
+```bash
 sudo /usr/local/sbin/update-readsb-aircraft-db
 ```
 
-Or with an authenticated SSH key:
+This downloads fresh copies of both upstream source databases, validates them, performs the merge, validates both generated projections, and atomically installs the results.
 
-```bash
-git clone git@github.com:r4streando/readsb-aircraft-db.git
-cd readsb-aircraft-db
-sudo bash install.sh
-sudo /usr/local/sbin/update-readsb-aircraft-db
-```
+No GitHub credentials or ADS-B Exchange API key are required.
 
-Then add to the readsb decoder options:
+### 4. Point readsb at the generated database
+
+Add these options to the readsb decoder command line:
 
 ```text
 --db-file /var/lib/readsb-aircraft-db/aircraft.csv.gz --db-file-lt
 ```
 
-Restart readsb once after changing its command-line configuration. The updater thereafter atomically replaces the database file; current readsb detects database mtime changes and reloads it.
+On common Debian/Raspberry Pi OS readsb installations, decoder options are configured in:
 
-## Automatic updates
+```text
+/etc/default/readsb
+```
 
-The installer places `/etc/cron.d/readsb-aircraft-db`, which runs daily at 03:17 local time. The updater downloads both sources fresh on every run, validates them, merges them, writes an audit report/conflict file, keeps rolling backups, and does not replace the installed database if its uncompressed content is unchanged.
+Append the two flags to the existing `DECODER_OPTIONS` value rather than replacing any options already present.
 
-Source snapshots:
+Restart readsb once after changing its command-line configuration:
 
-- Wiedehopf: `https://raw.githubusercontent.com/wiedehopf/tar1090-db/csv/aircraft.csv.gz`
-- ADS-B Exchange: `https://downloads.adsbexchange.com/downloads/basic-ac-db.json.gz`
+```bash
+sudo systemctl restart readsb
+```
 
-## Data path
+Current readsb versions monitor the database file for mtime changes, so subsequent database refreshes do **not** require a readsb restart.
+
+### 5. Verify the installation
+
+Check that the generated files and audit report exist:
+
+```bash
+ls -lh \
+  /var/lib/readsb-aircraft-db/aircraft.csv.gz \
+  /var/lib/readsb-aircraft-db/vdlm2-aircraft.json \
+  /var/lib/readsb-aircraft-db/last-report.json \
+  /var/lib/readsb-aircraft-db/last-conflicts.csv.gz
+
+gzip -t /var/lib/readsb-aircraft-db/aircraft.csv.gz
+```
+
+To confirm that readsb is actually running with the database options:
+
+```bash
+tr '\0' ' ' </proc/$(pidof readsb)/cmdline
+echo
+```
+
+You should see:
+
+```text
+--db-file /var/lib/readsb-aircraft-db/aircraft.csv.gz --db-file-lt
+```
+
+## Automatic database updates
+
+The installer places `/etc/cron.d/readsb-aircraft-db`, which runs the updater every day at **03:17 local time**:
+
+```text
+17 03 * * * root READSB_DB_SYSLOG=1 /usr/local/sbin/update-readsb-aircraft-db
+```
+
+Each run downloads both upstream databases fresh. It does **not** depend on the local Git checkout and does not run `git pull`.
+
+The updater:
+
+- validates both downloaded gzip files;
+- reconciles the two source snapshots;
+- validates both generated projections before publication;
+- writes an audit report and compressed conflict report;
+- keeps rolling backups;
+- atomically replaces each installed projection independently;
+- preserves an existing file's mtime when its content is unchanged;
+- does not restart readsb or VDLm2 Monitor.
+
+With `READSB_DB_SYSLOG=1`, cron output is sent through `logger` using the tag `readsb-aircraft-db`. On systemd systems it can typically be inspected with:
+
+```bash
+journalctl -t readsb-aircraft-db
+```
+
+## Updating the installed code
+
+Daily database refreshes do not require updating the repository checkout. Pull the repository only when you want newer merger/updater code.
+
+From the checkout created during deployment:
+
+```bash
+cd readsb-aircraft-db
+git pull --ff-only
+sudo bash install.sh
+sudo /usr/local/sbin/update-readsb-aircraft-db
+```
+
+Because the repository is public, `git pull` over HTTPS requires no GitHub authentication.
+
+## Upstream data sources
+
+The updater currently downloads:
+
+- Wiedehopf tar1090/readsb database: `https://raw.githubusercontent.com/wiedehopf/tar1090-db/csv/aircraft.csv.gz`
+- ADS-B Exchange basic aircraft database: `https://downloads.adsbexchange.com/downloads/basic-ac-db.json.gz`
+
+Both URLs can be overridden with environment variables.
+
+## State, reports, and backups
 
 Generated databases:
 
@@ -67,8 +219,6 @@ Generated databases:
 /var/lib/readsb-aircraft-db/aircraft.csv.gz
 /var/lib/readsb-aircraft-db/vdlm2-aircraft.json
 ```
-
-The updater validates both candidates before changing either installed output. Each changed file is staged alongside its destination and atomically renamed into place. Content hashes and mtimes are handled independently: readsb uses the uncompressed SHA-256, while VDLm2 uses the ordinary file SHA-256. Backups are separately scoped. The updater does not restart either consumer; VDLm2 Monitor must be restarted or gain its own hot-reload support before a changed database is loaded.
 
 Audit artifacts:
 
@@ -78,11 +228,43 @@ Audit artifacts:
 /var/lib/readsb-aircraft-db/backups/
 ```
 
-Environment overrides include `DEST`, `VDLM2_DEST`, `BACKUP_DIR`, and `VDLM2_BACKUP_DIR`.
+The updater stages changed files beside their destinations and atomically renames them into place only after validation succeeds.
+
+Content-change detection is independent for the two projections:
+
+- readsb uses SHA-256 of the **uncompressed** CSV content;
+- VDLm2 uses SHA-256 of the JSON file.
+
+Backups are independently scoped as well.
+
+VDLm2 Monitor must be restarted, or implement its own hot-reload mechanism, before it will load a changed VDLm2 database.
+
+## Configuration overrides
+
+The updater can be customized with environment variables, including:
+
+```text
+STATE_DIR
+DEST
+BACKUP_DIR
+VDLM2_DEST
+VDLM2_BACKUP_DIR
+WIEDEHOPF_URL
+ADSBX_URL
+MIN_RECORDS
+MAX_INPUT_ERRORS
+KEEP_BACKUPS
+VDLM2_KEEP_BACKUPS
+LOCKFILE
+MERGER
+READSB_DB_SYSLOG
+```
+
+Defaults are defined near the top of `update-readsb-aircraft-db`.
 
 ## Tests
 
-The test suite uses only generated local fixtures and temporary directories:
+The test suite uses generated local fixtures and temporary directories only:
 
 ```bash
 python3 -m unittest discover -s tests -v
